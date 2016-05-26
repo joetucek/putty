@@ -14,6 +14,8 @@
 #include "misc.h"
 
 #define rsa_signature "SSH PRIVATE KEY FILE FORMAT 1.1\n"
+/*128 derived by seeing what was tolerable*/
+#define KDF_ITER (128)
 
 #define BASE64_TOINT(x) ( (x)-'A'<26 ? (x)-'A'+0 :\
                           (x)-'a'<26 ? (x)-'a'+26 :\
@@ -442,7 +444,9 @@ int saversakey(const Filename *filename, struct RSAKey *key, char *passphrase)
  *
  * The next line says "Encryption: " plus an encryption type.
  * Currently the only supported encryption types are "aes256-cbc"
- * and "none".
+ * and "none" in the released version.  There is experimental support
+ * for "bcrypt-aes256-cbc" which uses the openssh bcrypt KDF to improve
+ * resistance to passphrase brute-forcing.
  *
  * The next line says "Comment: " plus the comment string.
  *
@@ -646,7 +650,8 @@ struct ssh2_userkey *ssh2_load_userkey(const Filename *filename,
     int i, is_mac, old_fmt;
     int passlen = passphrase ? strlen(passphrase) : 0;
     const char *error = NULL;
-
+    unsigned char key[40];
+    
     ret = NULL;			       /* return NULL for most errors */
     encryption = comment = mac = NULL;
     public_blob = private_blob = NULL;
@@ -694,6 +699,9 @@ struct ssh2_userkey *ssh2_load_userkey(const Filename *filename,
     if (!strcmp(encryption, "aes256-cbc")) {
 	cipher = 1;
 	cipherblk = 16;
+    } else if (!strcmp(encryption, "bcrypt-aes256-cbc")) {
+      cipher = 2;
+      cipherblk = 16;
     } else if (!strcmp(encryption, "none")) {
 	cipher = 0;
 	cipherblk = 1;
@@ -717,6 +725,33 @@ struct ssh2_userkey *ssh2_load_userkey(const Filename *filename,
     if ((public_blob = read_blob(fp, i, &public_blob_len)) == NULL)
 	goto error;
 
+    /*Do KDF if necessary*/
+    if (cipher) {
+      SHA_State s;
+      if (!passphrase)
+	goto error;
+      if (cipher==2) {
+	unsigned char salt[40];
+	SHA_Init(&s);
+	SHA_Bytes(&s, public_blob, public_blob_len/2);
+	SHA_Final(&s, salt+0);
+	SHA_Init(&s);
+	SHA_Bytes(&s, "SecondHalf", 10);
+	SHA_Bytes(&s, public_blob, public_blob_len);
+	SHA_Final(&s, salt+20);
+	openssh_bcrypt(passphrase, salt, 40, KDF_ITER, key, 40); 
+      } else if (cipher==1) {
+	SHA_Init(&s);
+	SHA_Bytes(&s, "\0\0\0\0", 4);
+	SHA_Bytes(&s, passphrase, passlen);
+	SHA_Final(&s, key + 0);
+	SHA_Init(&s);
+	SHA_Bytes(&s, "\0\0\0\1", 4);
+	SHA_Bytes(&s, passphrase, passlen);
+	SHA_Final(&s, key + 20);
+      }
+    }
+    
     /* Read the Private-Lines header line and the Private blob. */
     if (!read_header(fp, header) || 0 != strcmp(header, "Private-Lines"))
 	goto error;
@@ -748,22 +783,9 @@ struct ssh2_userkey *ssh2_load_userkey(const Filename *filename,
      * Decrypt the private blob.
      */
     if (cipher) {
-	unsigned char key[40];
-	SHA_State s;
-
-	if (!passphrase)
-	    goto error;
 	if (private_blob_len % cipherblk)
 	    goto error;
 
-	SHA_Init(&s);
-	SHA_Bytes(&s, "\0\0\0\0", 4);
-	SHA_Bytes(&s, passphrase, passlen);
-	SHA_Final(&s, key + 0);
-	SHA_Init(&s);
-	SHA_Bytes(&s, "\0\0\0\1", 4);
-	SHA_Bytes(&s, passphrase, passlen);
-	SHA_Final(&s, key + 20);
 	aes256_decrypt_pubkey(key, private_blob, private_blob_len);
     }
 
@@ -811,8 +833,10 @@ struct ssh2_userkey *ssh2_load_userkey(const Filename *filename,
 
 	    SHA_Init(&s);
 	    SHA_Bytes(&s, header, sizeof(header)-1);
-	    if (cipher && passphrase)
+	    if (cipher==1 && passphrase)
 		SHA_Bytes(&s, passphrase, passlen);
+	    else if (cipher==2)
+	      SHA_Bytes(&s, key, 40);
 	    SHA_Final(&s, mackey);
 
 	    hmac_sha1_simple(mackey, 20, macdata, maclen, binary);
@@ -873,6 +897,7 @@ struct ssh2_userkey *ssh2_load_userkey(const Filename *filename,
      * Error processing.
      */
   error:
+    smemclr(key, 40);
     if (fp)
 	fclose(fp);
     if (comment)
@@ -1262,7 +1287,7 @@ int ssh2_userkey_encrypted(const Filename *filename, char **commentptr)
         sfree(comment);
 
     fclose(fp);
-    if (!strcmp(b, "aes256-cbc"))
+    if (!strcmp(b, "aes256-cbc") || ~strcmp(b, "bcrypt-aes256-cbc"))
 	ret = 1;
     else
 	ret = 0;
@@ -1305,12 +1330,12 @@ int ssh2_save_userkey(const Filename *filename, struct ssh2_userkey *key,
     FILE *fp;
     unsigned char *pub_blob, *priv_blob, *priv_blob_encrypted;
     int pub_blob_len, priv_blob_len, priv_encrypted_len;
-    int passlen;
     int cipherblk;
     int i;
     const char *cipherstr;
     unsigned char priv_mac[20];
-
+    unsigned char enc_key[40];
+    
     /*
      * Fetch the key component blobs.
      */
@@ -1326,8 +1351,19 @@ int ssh2_save_userkey(const Filename *filename, struct ssh2_userkey *key,
      * Determine encryption details, and encrypt the private blob.
      */
     if (passphrase) {
-	cipherstr = "aes256-cbc";
+	cipherstr = "bcrypt-aes256-cbc";
 	cipherblk = 16;
+	SHA_State s;
+	unsigned char salt[40];
+	SHA_Init(&s);
+	SHA_Bytes(&s, pub_blob, pub_blob_len/2);
+	SHA_Final(&s, salt+0);
+	SHA_Init(&s);
+	SHA_Bytes(&s, "SecondHalf", 10);
+	SHA_Bytes(&s, pub_blob, pub_blob_len);
+	SHA_Final(&s, salt+20);
+	openssh_bcrypt(passphrase, salt, 40, KDF_ITER, enc_key, 40); 
+	smemclr(&s, sizeof(s));
     } else {
 	cipherstr = "none";
 	cipherblk = 1;
@@ -1373,7 +1409,7 @@ int ssh2_save_userkey(const Filename *filename, struct ssh2_userkey *key,
 	SHA_Init(&s);
 	SHA_Bytes(&s, header, sizeof(header)-1);
 	if (passphrase)
-	    SHA_Bytes(&s, passphrase, strlen(passphrase));
+	    SHA_Bytes(&s, enc_key, 40);
 	SHA_Final(&s, mackey);
 	hmac_sha1_simple(mackey, 20, macdata, maclen, priv_mac);
 	smemclr(macdata, maclen);
@@ -1383,24 +1419,10 @@ int ssh2_save_userkey(const Filename *filename, struct ssh2_userkey *key,
     }
 
     if (passphrase) {
-	unsigned char key[40];
-	SHA_State s;
-
-	passlen = strlen(passphrase);
-
-	SHA_Init(&s);
-	SHA_Bytes(&s, "\0\0\0\0", 4);
-	SHA_Bytes(&s, passphrase, passlen);
-	SHA_Final(&s, key + 0);
-	SHA_Init(&s);
-	SHA_Bytes(&s, "\0\0\0\1", 4);
-	SHA_Bytes(&s, passphrase, passlen);
-	SHA_Final(&s, key + 20);
-	aes256_encrypt_pubkey(key, priv_blob_encrypted,
+	aes256_encrypt_pubkey(enc_key, priv_blob_encrypted,
 			      priv_encrypted_len);
 
-	smemclr(key, sizeof(key));
-	smemclr(&s, sizeof(s));
+	smemclr(enc_key, sizeof(enc_key));
     }
 
     fp = f_open(filename, "w", TRUE);
