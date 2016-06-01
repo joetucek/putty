@@ -8,22 +8,79 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <math.h>
 
 #include "putty.h"
 #include "ssh.h"
 #include "misc.h"
 
 #define rsa_signature "SSH PRIVATE KEY FILE FORMAT 1.1\n"
-/*128 derived by seeing what was tolerable*/
-#define KDF_ITER (128)
+
+#define INTBUILDYEAR ( (__DATE__[7]-'0') * 1000 +\
+		       (__DATE__[8]-'0') * 100  +\
+		       (__DATE__[9]-'0') * 10   +\
+		       (__DATE__[10]-'0') )
+
+/*Default of 64 derived by seeing what was tolerable*/
+#define KDF_ITER_BASE (64)
+/* 16 seems to be a viable absolute floor; never ever support less
+ * Note that this value cannot be changed to maintain compatability*/
+#define KDF_ITER_MIN (16)
+
 
 #define BASE64_TOINT(x) ( (x)-'A'<26 ? (x)-'A'+0 :\
                           (x)-'a'<26 ? (x)-'a'+26 :\
                           (x)-'0'<10 ? (x)-'0'+52 :\
                           (x)=='+' ? 62 : \
                           (x)=='/' ? 63 : 0 )
+#define INT_TOBASE64(x) ( (x) <  0 ? '=' :\
+			  (x) < 26 ? (x)+'A' :\
+			  (x) < 52 ? (x)+'a'-26 :\
+			  (x) < 62 ? (x)+'0'-52 :\
+			  (x)== 62 ? '+' :\
+			  (x)== 63 ? '/' : '=' )
 
 static int key_type_fp(FILE *fp);
+
+static int kdf_iters_from_b64(char * enc) {
+  int retval = BASE64_TOINT(enc[0]);
+  retval = retval << (3 * BASE64_TOINT(enc[1]));
+  if(retval<KDF_ITER_MIN)
+    return KDF_ITER_MIN;
+  else
+    return retval;
+}
+
+static int kdf_b64_from_iters(char * enc, int iters) {
+  int power = 0;
+  int mul = 1;
+  
+  if(iters<KDF_ITER_MIN) {
+    iters = KDF_ITER_MIN; /*We refuse to even encode too low;*/
+  }
+
+  while ((mul * 63) < iters) {
+    mul = mul << 3;
+    power++;
+  }
+  enc[1] = INT_TOBASE64(power);
+  enc[0] = INT_TOBASE64(iters/mul);
+  return kdf_iters_from_b64(enc);
+}
+
+static int default_kdf_iters() {
+  float mult;
+  float now = time(0);
+  if(now<(INTBUILDYEAR-2016) * 31557600 + 1451606400) {
+    /*We traveled back in time?! It simply cannot beb earlier than 2016*/
+    mult=1;
+  } else {
+    /*Using Jan 1 2016 as our base, double every 2 years.*/
+    mult = powf(1.414, (now-1451606400)/31557600.0);
+  }
+  return KDF_ITER_BASE * mult;
+}
+
 
 static int loadrsakey_main(FILE * fp, struct RSAKey *key, int pub_only,
 			   char **commentptr, const char *passphrase,
@@ -445,7 +502,7 @@ int saversakey(const Filename *filename, struct RSAKey *key, char *passphrase)
  * The next line says "Encryption: " plus an encryption type.
  * Currently the only supported encryption types are "aes256-cbc"
  * and "none" in the released version.  There is experimental support
- * for "bcrypt-aes256-cbc" which uses the openssh bcrypt KDF to improve
+ * for "kdf-bcryptXX-aes256-cbc" which uses the openssh bcrypt KDF to improve
  * resistance to passphrase brute-forcing.
  *
  * The next line says "Comment: " plus the comment string.
@@ -699,7 +756,9 @@ struct ssh2_userkey *ssh2_load_userkey(const Filename *filename,
     if (!strcmp(encryption, "aes256-cbc")) {
 	cipher = 1;
 	cipherblk = 16;
-    } else if (!strcmp(encryption, "bcrypt-aes256-cbc")) {
+    } else if (strlen(encryption)>13 &&
+	       !memcmp(encryption, "kdf-bcrypt", 10) &&
+	       !memcmp(encryption+13, "aes256-cbc", 10)) {
       cipher = 2;
       cipherblk = 16;
     } else if (!strcmp(encryption, "none")) {
@@ -732,6 +791,11 @@ struct ssh2_userkey *ssh2_load_userkey(const Filename *filename,
 	goto error;
       if (cipher==2) {
 	unsigned char salt[40];
+	int iters = kdf_iters_from_b64(encryption + 10);
+	if (iters > default_kdf_iters() * 1000) {
+	  /*This will take way too long; avoid DOS*/
+	  goto error;
+	}
 	SHA_Init(&s);
 	SHA_Bytes(&s, public_blob, public_blob_len/2);
 	SHA_Final(&s, salt+0);
@@ -739,7 +803,7 @@ struct ssh2_userkey *ssh2_load_userkey(const Filename *filename,
 	SHA_Bytes(&s, "SecondHalf", 10);
 	SHA_Bytes(&s, public_blob, public_blob_len);
 	SHA_Final(&s, salt+20);
-	openssh_bcrypt(passphrase, salt, 40, KDF_ITER, key, 40); 
+	openssh_bcrypt(passphrase, salt, 40, iters, key, 40); 
       } else if (cipher==1) {
 	SHA_Init(&s);
 	SHA_Bytes(&s, "\0\0\0\0", 4);
@@ -1287,7 +1351,8 @@ int ssh2_userkey_encrypted(const Filename *filename, char **commentptr)
         sfree(comment);
 
     fclose(fp);
-    if (!strcmp(b, "aes256-cbc") || ~strcmp(b, "bcrypt-aes256-cbc"))
+    if (!strcmp(b, "aes256-cbc") ||
+	(strlen(b)>4 && !memcmp(b, "kdf-", 4)))
 	ret = 1;
     else
 	ret = 0;
@@ -1332,9 +1397,10 @@ int ssh2_save_userkey(const Filename *filename, struct ssh2_userkey *key,
     int pub_blob_len, priv_blob_len, priv_encrypted_len;
     int cipherblk;
     int i;
-    const char *cipherstr;
+    char *cipherstr;
     unsigned char priv_mac[20];
     unsigned char enc_key[40];
+    int kdf_iters;
     
     /*
      * Fetch the key component blobs.
@@ -1351,22 +1417,24 @@ int ssh2_save_userkey(const Filename *filename, struct ssh2_userkey *key,
      * Determine encryption details, and encrypt the private blob.
      */
     if (passphrase) {
-	cipherstr = "bcrypt-aes256-cbc";
-	cipherblk = 16;
-	SHA_State s;
-	unsigned char salt[40];
-	SHA_Init(&s);
-	SHA_Bytes(&s, pub_blob, pub_blob_len/2);
-	SHA_Final(&s, salt+0);
-	SHA_Init(&s);
-	SHA_Bytes(&s, "SecondHalf", 10);
-	SHA_Bytes(&s, pub_blob, pub_blob_len);
-	SHA_Final(&s, salt+20);
-	openssh_bcrypt(passphrase, salt, 40, KDF_ITER, enc_key, 40); 
-	smemclr(&s, sizeof(s));
+      cipherstr = strdup("kdf-bcryptPA-aes256-cbc"); /*PA == 128 rounds*/
+      kdf_iters = default_kdf_iters();
+      kdf_iters = kdf_b64_from_iters(cipherstr+10, kdf_iters);
+      cipherblk = 16;
+      SHA_State s;
+      unsigned char salt[40];
+      SHA_Init(&s);
+      SHA_Bytes(&s, pub_blob, pub_blob_len/2);
+      SHA_Final(&s, salt+0);
+      SHA_Init(&s);
+      SHA_Bytes(&s, "SecondHalf", 10);
+      SHA_Bytes(&s, pub_blob, pub_blob_len);
+      SHA_Final(&s, salt+20);
+      openssh_bcrypt(passphrase, salt, 40, kdf_iters, enc_key, 40); 
+      smemclr(&s, sizeof(s));
     } else {
-	cipherstr = "none";
-	cipherblk = 1;
+      cipherstr = strdup("none");
+      cipherblk = 1;
     }
     priv_encrypted_len = priv_blob_len + cipherblk - 1;
     priv_encrypted_len -= priv_encrypted_len % cipherblk;
@@ -1452,6 +1520,7 @@ int ssh2_save_userkey(const Filename *filename, struct ssh2_userkey *key,
     sfree(priv_blob);
     smemclr(priv_blob_encrypted, priv_blob_len);
     sfree(priv_blob_encrypted);
+    sfree(cipherstr);
     return 1;
 }
 
